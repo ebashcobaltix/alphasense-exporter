@@ -1,0 +1,35 @@
+browser:
+  headless: true
+  window_size:
+    width: 1920
+    height: 1080
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  timeout: 30
+  implicit_wait: 10
+
+alphasense:
+  base_url: "https://research.alpha-sense.com"
+  login_url: "https://research.alpha-sense.com/login"
+  search_url: "https://research.alpha-sense.com/search"
+  export_url: "https://research.alpha-sense.com/export"
+  saved_searches_url: "https://research.alpha-sense.com/saved-searches"
+
+scraping:
+  delay_between_requests: 2
+  max_retries: 3
+  retry_delay: 5
+  batch_size: 50
+  max_results_per_query: 1000
+
+export:
+  default_format: "zip"
+  output_directory: "./exports"
+  filename_template: "alphasense_export_{timestamp}_{query}"
+  include_metadata: true
+  compress_output: false
+
+logging:
+  level: "INFO"
+  file: "./logs/scraper.log"
+  max_file_size: "10MB"
+  backup_count: 5 
