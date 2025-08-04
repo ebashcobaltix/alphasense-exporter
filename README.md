@@ -37,7 +37,7 @@ Or pass them as command-line arguments.
 ### Export All Saved Searches in `saved_searches.csv`:
 
 ```bash
-python main.py --no-headlesss
+python main.py --no-headless
 ```
 
 **Optional Arguments:**
