@@ -1,7 +1,6 @@
-# scraper.py
-
 import time
 import os
+import json
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -28,13 +27,16 @@ from logger import get_logger
 
 
 class AlphaSenseScraper:
-    """Core scraper class for AlphaSense saved search exports"""
+    """AlphaSense scraper with cached export strategy + simple 'export first N' path"""
     
     def __init__(self, config: Config, headless: bool = True):
         self.config = config
         self.logger = get_logger(__name__)
         self.driver = None
         self.headless = headless
+        self.collected_row_data = []
+        self.cache_dir = Path('./cache')
+        self.cache_dir.mkdir(exist_ok=True)
         
         self._setup_browser()
     
@@ -97,16 +99,13 @@ class AlphaSenseScraper:
 
         try:
             username_field = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='loginUsername']")))
-            print(username_field)
             username_field.clear()
             username_field.send_keys(username)
         except TimeoutException:
             self.logger.error("Could not find username/email field")
             return False
 
-        
         self.logger.info("Pressing continue")
-
 
         try:
             continue_button = self.driver.find_element(By.XPATH, "//button[contains(text(), 'Continue')]")
@@ -114,7 +113,6 @@ class AlphaSenseScraper:
         except NoSuchElementException:
             self.logger.error("Could not find Continue button")
             return False
-
 
         self.logger.info("Entering password")
 
@@ -156,35 +154,111 @@ class AlphaSenseScraper:
             self.logger.warning(f"Could not determine login status: {e}")
             return False
 
-    def _wait_for_results(self, timeout: int = 5) -> bool:
+    def _wait_for_results(self, timeout: int = 20) -> bool:
+        """Sturdier wait that tolerates slow paint, ensures at least one row exists."""
         try:
-            self.wait.until(EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "div[data-testid='resultsPaneCell-checkbox'] input[type='checkbox']")
+            self.wait.until(EC.any_of(
+                EC.presence_of_element_located((By.CSS_SELECTOR, 'div[data-testid="ResultsListRow"]')),
+                EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="ResultsList"]'))
             ))
-            self.logger.info("✅ At least one result row loaded.")
+            WebDriverWait(self.driver, timeout).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, 'div[data-testid="ResultsListRow"]'))
+            )
+            self.logger.info("✅ Results loaded")
             return True
         except TimeoutException:
-            self.logger.error("❌ Timeout: No result rows loaded in time.")
+            self.logger.error("❌ Results did not load")
             return False
+
+    def _get_cache_filename(self, search_id: str) -> str:
+        """Generate cache filename for search results"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"search_{search_id}_{timestamp}.json"
+
+    def _save_to_cache(self, search_id: str, data: list) -> str:
+        """Save collected data to cache file"""
+        cache_file = self.cache_dir / self._get_cache_filename(search_id)
+        
+        cache_data = {
+            'search_id': search_id,
+            'collected_at': datetime.now().isoformat(),
+            'total_rows': len(data),
+            'rows': data
+        }
+        
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, indent=2, ensure_ascii=False)
+        
+        self.logger.info(f"💾 Saved {len(data)} rows to cache: {cache_file}")
+        return str(cache_file)
+
+    def _load_from_cache(self, cache_file: str) -> dict:
+        """Load data from cache file"""
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        self.logger.info(f"📂 Loaded {data['total_rows']} rows from cache: {cache_file}")
+        return data
+
+    def _get_scrollable_container(self):
+        """Find the scrollable container for the virtualized list (robust against wrappers)."""
+        candidates = [
+            '[data-testid="ResultsList"] [class*="simplebar-content-wrapper"]',
+            'div[name="ResultList"] div[style*="overflow"]',
+            'div[name="ResultList"]',
+        ]
+        for css in candidates:
+            try:
+                el = self.driver.find_element(By.CSS_SELECTOR, css)
+                self.logger.info(f"Found scrollable container via: {css}")
+                return el
+            except NoSuchElementException:
+                continue
+        self.logger.warning("Could not find scrollable container, using body")
+        return self.driver.find_element(By.TAG_NAME, 'body')
+
+    # --------- JS helpers to avoid stale element references ---------
+
+    def _get_scrollable_container_js(self):
+        """Return the scrollable container via JS each time (no Python element refs)."""
+        return self.driver.execute_script("""
+            let c =
+              document.querySelector('[data-testid="ResultsList"] [class*="simplebar-content-wrapper"]') ||
+              document.querySelector('div[name="ResultList"] div[style*="overflow"]') ||
+              document.querySelector('div[name="ResultList"]');
+            return c || document.body;
+        """)
+
+    def _scroll_row_into_view_js(self, row_index: int) -> bool:
+        """
+        Make row with data-cy-rowindex == row_index render & be visible.
+        Works with virtualized lists by incrementally scrolling until found.
+        """
+        for _ in range(18):  # up to ~18 'pages'
+            found = self.driver.execute_script("""
+                const idx = arguments[0];
+                const sel = `div[data-testid="ResultsListRow"][data-cy-rowindex="${idx}"]`;
+                const row = document.querySelector(sel);
+                if (row) {
+                    row.scrollIntoView({block: 'center'});
+                    return true;
+                }
+                let c =
+                  document.querySelector('[data-testid="ResultsList"] [class*="simplebar-content-wrapper"]') ||
+                  document.querySelector('div[name="ResultList"] div[style*="overflow"]') ||
+                  document.querySelector('div[name="ResultList"]') ||
+                  document.body;
+                c.scrollTop += c.clientHeight * 0.92;
+                return false;
+            """, row_index)
+            if found:
+                return True
+            time.sleep(0.25)
+        return False
 
     def _scroll_to_load_more_rows(self, target_rows: int = 121) -> int:
         """Scroll through virtualized list and collect data in batches"""
-        selector = 'div[data-testid="ResultsListRow"]'
-        
-        try:
-            # Find the scrollable container
-            scrollable_container = self.driver.find_element(
-                By.CSS_SELECTOR,
-                'div[name="ResultList"] div[style*="overflow"]'
-            )
-            self.logger.info(f"Found scrollable container with selector: div[name=\"ResultList\"] div[style*=\"overflow\"]")
-        except NoSuchElementException:
-            try:
-                scrollable_container = self.driver.find_element(By.CSS_SELECTOR, 'div[name="ResultList"]')
-                self.logger.info(f"Found scrollable container with fallback selector: div[name=\"ResultList\"]")
-            except NoSuchElementException:
-                self.logger.warning("Could not find scrollable container, using body")
-                scrollable_container = self.driver.find_element(By.TAG_NAME, 'body')
+        scrollable_container = self._get_scrollable_container()
 
         all_row_data = []
         seen_document_ids = set()
@@ -261,24 +335,10 @@ class AlphaSenseScraper:
                     else:
                         consecutive_no_new_items = 0  # Reset for new strategy
                 
-                # Try different loading strategies based on current strategy
+                # Try different loading strategies
                 strategy = strategies[current_strategy % len(strategies)]
                 
-                if strategy == "keyboard_navigation":
-                    # Try using keyboard navigation to trigger loading
-                    try:
-                        last_row = self.driver.find_elements(By.CSS_SELECTOR, selector)[-1] if self.driver.find_elements(By.CSS_SELECTOR, selector) else None
-                        if last_row:
-                            last_row.click()
-                            time.sleep(0.2)
-                            # Use arrow keys to navigate beyond visible area
-                            for _ in range(10):
-                                last_row.send_keys(Keys.ARROW_DOWN)
-                                time.sleep(0.1)
-                    except Exception:
-                        pass
-                
-                elif strategy == "scroll_container":
+                if strategy == "scroll_container":
                     # Aggressive container scrolling
                     for i in range(5):
                         self.driver.execute_script(
@@ -293,29 +353,7 @@ class AlphaSenseScraper:
                         self.driver.execute_script("window.scrollBy(0, 1000);")
                         time.sleep(0.3)
                 
-                elif strategy == "click_last_row":
-                    # Click on the last visible row and try to trigger more loading
-                    try:
-                        rows = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                        if rows:
-                            last_row = rows[-1]
-                            self.driver.execute_script("arguments[0].scrollIntoView();", last_row)
-                            time.sleep(0.2)
-                            last_row.click()
-                            time.sleep(0.5)
-                    except Exception:
-                        pass
-                
-                elif strategy == "page_down_keys":
-                    # Try page down keys multiple times
-                    try:
-                        for _ in range(5):
-                            scrollable_container.send_keys(Keys.PAGE_DOWN)
-                            time.sleep(0.2)
-                        scrollable_container.send_keys(Keys.END)
-                        time.sleep(0.5)
-                    except Exception:
-                        pass
+                # other strategies could be added similarly
                         
             else:
                 consecutive_no_new_items = 0 
@@ -334,12 +372,324 @@ class AlphaSenseScraper:
         self.collected_row_data = all_row_data
         
         return len(all_row_data)
-    
-    def export_saved_search(self, search_id: str, max_results: int = 100,  output_dir: str = './exports') -> list:
-        """Export a saved search in batches of 20 by visible row index, aggregate all files."""
 
+    def _scroll_to_specific_row_index(self, target_row_index: int, scrollable_container) -> bool:
+        """
+        Scroll to make a specific row index visible in the virtualized list
+        Returns True if row is found and visible, False otherwise
+        """
+        max_attempts = 15
+        
+        for attempt in range(max_attempts):
+            try:
+                # Get currently visible rows
+                visible_rows = self.driver.find_elements(By.CSS_SELECTOR, 'div[data-testid="ResultsListRow"]')
+                
+                # Check current visible range
+                current_visible_indexes = []
+                for row in visible_rows:
+                    row_index = row.get_attribute('data-cy-rowindex')
+                    if row_index:
+                        try:
+                            current_visible_indexes.append(int(row_index))
+                        except ValueError:
+                            continue
+                
+                if not current_visible_indexes:
+                    self.logger.warning(f"No visible row indexes found on attempt {attempt + 1}")
+                    continue
+                
+                min_visible = min(current_visible_indexes)
+                max_visible = max(current_visible_indexes)
+                
+                # Check if target row is already visible
+                if min_visible <= target_row_index <= max_visible:
+                    self.logger.info(f"✅ Target row {target_row_index} is visible (range: {min_visible}-{max_visible})")
+                    return True
+                
+                # Calculate scroll direction and amount
+                if target_row_index < min_visible:
+                    # Need to scroll up
+                    scroll_amount = -(scrollable_container.size['height'] // 2)
+                    self.logger.info(f"🔼 Scrolling up to reach row {target_row_index} (currently {min_visible}-{max_visible})")
+                else:
+                    # Need to scroll down
+                    scroll_amount = scrollable_container.size['height'] // 2
+                    self.logger.info(f"🔽 Scrolling down to reach row {target_row_index} (currently {min_visible}-{max_visible})")
+                
+                # Perform scroll
+                self.driver.execute_script(
+                    "arguments[0].scrollTop += arguments[1];", 
+                    scrollable_container, 
+                    scroll_amount
+                )
+                time.sleep(0.8)  # Give time for virtualized list to update
+                
+            except Exception as e:
+                self.logger.warning(f"Error in scroll attempt {attempt + 1} for row {target_row_index}: {e}")
+                time.sleep(0.5)
+        
+        self.logger.error(f"❌ Failed to make row {target_row_index} visible after {max_attempts} attempts")
+        return False
+
+    def _select_checkbox_in_row(self, row) -> bool:
+        """
+        Hover to reveal the checkbox, then click (with JS/React-friendly fallbacks).
+        Returns True if selected.
+        """
         try:
-            self.logger.info(f"Exporting saved search: (ID: {search_id})")
+            # Hover often reveals row actions/checkbox
+            try:
+                ActionChains(self.driver).move_to_element(row).pause(0.15).perform()
+            except Exception:
+                pass
+
+            checkbox = None
+            for sel in [
+                'input[data-chmlnid="ResultListDocumentCheckbox"]',
+                'div[data-testid="resultsPaneCell-checkbox"] input[type="checkbox"]',
+                'input[type="checkbox"]'
+            ]:
+                try:
+                    checkbox = row.find_element(By.CSS_SELECTOR, sel)
+                    break
+                except NoSuchElementException:
+                    continue
+
+            if checkbox is None:
+                # Try clicking likely container to reveal/activate
+                try:
+                    container = row.find_element(By.CSS_SELECTOR, 'div[data-testid="resultsPaneCell-checkbox"], [class*="checkbox"]')
+                    self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", row)
+                    time.sleep(0.1)
+                    self.driver.execute_script("arguments[0].click();", container)
+                    time.sleep(0.1)
+                    checkbox = row.find_element(By.CSS_SELECTOR, 'input[type="checkbox"]')
+                except Exception:
+                    return False
+
+            if checkbox.is_selected():
+                return True
+
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", row)
+            time.sleep(0.05)
+            try:
+                checkbox.click()
+            except Exception:
+                try:
+                    self.driver.execute_script("arguments[0].click();", checkbox)
+                except Exception:
+                    # React-friendly event bubbling
+                    self.driver.execute_script("""
+                        const cb = arguments[0];
+                        cb.checked = true;
+                        ['mousedown','mouseup','click','input','change'].forEach(t => {
+                            cb.dispatchEvent(new Event(t, {bubbles:true}));
+                        });
+                    """, checkbox)
+
+            time.sleep(0.05)
+            return checkbox.is_selected()
+        except Exception:
+            return False
+
+    def _wait_for_download(self, download_dir: str, timeout: int = 30) -> bool:
+        """Wait for download to complete"""
+        download_path = Path(download_dir)
+        initial_files = set(download_path.glob('*')) if download_path.exists() else set()
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if download_path.exists():
+                current_files = set(download_path.glob('*'))
+                new_files = current_files - initial_files
+                if new_files:
+                    self.logger.info(f"✅ Download detected: {list(new_files)}")
+                    return True
+            time.sleep(1)
+        
+        self.logger.warning("⚠️ No download detected")
+        return False
+
+    def _click_export_button(self) -> bool:
+        """Handle export button clicking (handles 'Export documents'/'Export original' & More-menu)."""
+        time.sleep(0.8)  # allow toolbar to enable after last selection
+
+        # Direct toolbar button
+        clicked = self.driver.execute_script("""
+            const labels = ['export original','export documents','export'];
+            const buttons = [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null);
+            for (const btn of buttons) {
+                const t = (btn.textContent || '').trim().toLowerCase();
+                if (labels.some(l => t.includes(l)) && !btn.disabled) { btn.click(); return true; }
+            }
+            return false;
+        """)
+        if clicked:
+            self.logger.info("✅ Export button clicked successfully!")
+            return True
+
+        # “More” -> Export
+        self.logger.info("🔄 Looking for More button...")
+        more = self.driver.execute_script("""
+            const btn = [...document.querySelectorAll('button')]
+              .find(b => (b.textContent||'').toLowerCase().includes('more') && b.offsetParent !== null);
+            if (btn) { btn.click(); return true; }
+            return false;
+        """)
+        if more:
+            time.sleep(0.4)
+            export_clicked = self.driver.execute_script("""
+                const items = [...document.querySelectorAll('button, [role="menuitem"], [data-testid]')]
+                    .filter(x => x.offsetParent !== null);
+                for (const el of items) {
+                    const t = (el.textContent||'').toLowerCase();
+                    if (t.includes('export')) { el.click(); return true; }
+                }
+                return false;
+            """)
+            if export_clicked:
+                self.logger.info("✅ Export clicked from More menu!")
+                return True
+
+        self.logger.error("❌ Failed to click export button")
+        return False
+
+    # ---------- Simple "first N" selection & export ----------
+
+    def _row_soft_key(self, row) -> str:
+        """Fallback dedupe key if the hard document id isn't present."""
+        try:
+            title = row.find_element(By.CSS_SELECTOR, '[data-testid="resultsPaneCell-title"]').text.strip()
+        except Exception:
+            title = ""
+        try:
+            date = row.find_element(By.CSS_SELECTOR, '[data-cy="releaseDate"]').text.strip()
+        except Exception:
+            date = ""
+        return f"{title}||{date}".lower()
+
+    def _select_first_n_checkboxes(self, n: int = 20) -> int:
+        """
+        JS-only selection to avoid stale element refs. Re-queries each time.
+        Selects rows 0..n-1 by row index; tolerates gaps by advancing when needed.
+        """
+        selected = 0
+        tries_without_progress = 0
+        max_tries = 12
+        # optional: skip non-doc rows if they exist (dividers/ads)
+        offset = 0
+
+        while selected < n and tries_without_progress < max_tries:
+            target_index = selected + offset  # aim sequentially, but allow skipping
+            # Ensure target row is rendered
+            if not self._scroll_row_into_view_js(target_index):
+                tries_without_progress += 1
+                offset += 1
+                continue
+
+            success = self.driver.execute_script("""
+                const idx = arguments[0];
+
+                // Locate the row by index
+                const rowSel = `div[data-testid="ResultsListRow"][data-cy-rowindex="${idx}"]`;
+                const row = document.querySelector(rowSel);
+                if (!row) return false;
+
+                // Hover-ish: move focus to row to reveal controls, if needed
+                row.dispatchEvent(new MouseEvent('mouseover', {bubbles:true}));
+
+                // Find a checkbox
+                let checkbox =
+                    row.querySelector('input[data-chmlnid="ResultListDocumentCheckbox"]') ||
+                    row.querySelector('div[data-testid="resultsPaneCell-checkbox"] input[type="checkbox"]') ||
+                    row.querySelector('input[type="checkbox"]');
+
+                // If not present, try clicking a likely container to mount it
+                if (!checkbox) {
+                    const container = row.querySelector('div[data-testid="resultsPaneCell-checkbox"], [class*="checkbox"]');
+                    if (container) container.click();
+                    checkbox =
+                        row.querySelector('input[data-chmlnid="ResultListDocumentCheckbox"]') ||
+                        row.querySelector('div[data-testid="resultsPaneCell-checkbox"] input[type="checkbox"]') ||
+                        row.querySelector('input[type="checkbox"]');
+                }
+                if (!checkbox) return false;
+
+                // If already selected, count as success
+                if (checkbox.checked) return true;
+
+                // Click normally first
+                try { checkbox.click(); } catch (_) {}
+
+                // If not selected, force-assign and dispatch React-friendly events
+                if (!checkbox.checked) {
+                    checkbox.checked = true;
+                    ['mousedown','mouseup','click','input','change'].forEach(t => {
+                        checkbox.dispatchEvent(new Event(t, {bubbles:true}));
+                    });
+                }
+                return !!checkbox.checked;
+            """, target_index)
+
+            if success:
+                selected += 1
+                tries_without_progress = 0
+                # Let toolbar enable as selections accrue
+                time.sleep(0.12)
+            else:
+                tries_without_progress += 1
+                offset += 1  # advance past non-interactable row
+
+        self.logger.info(f"Selected {selected} rows (requested {n})")
+        return selected
+
+    def export_first_n_in_search(self, search_id: str, n: int = 20, output_dir: str = './exports') -> bool:
+        """
+        Navigate to a saved search, select the first N items, click Export, and wait for the download.
+        """
+        try:
+            self.logger.info(f"🔎 Exporting first {n} docs from search {search_id}")
+
+            base_url = self.config.get_alphasense_config().get('base_url', 'https://research.alpha-sense.com')
+            search_url = f"{base_url}/search?search_id={search_id}"
+            self.driver.get(search_url)
+
+            if not self._wait_for_results(timeout=20):
+                raise Exception("Results did not load")
+
+            # Make the selections
+            selected = self._select_first_n_checkboxes(n=n)
+            if selected == 0:
+                self.logger.error("No rows were selected — aborting export.")
+                return False
+
+            # Click export
+            if not self._click_export_button():
+                self.logger.error("Export button not found/click failed.")
+                return False
+
+            # Wait for the download to show up
+            ok = self._wait_for_download(output_dir, timeout=90)
+            if ok:
+                self.logger.info("✅ Export started and file detected in downloads.")
+            else:
+                self.logger.warning("⚠️ Export attempted, but no download detected within timeout.")
+            return ok
+        except Exception as e:
+            self.logger.error(f"Failed export_first_n_in_search: {e}")
+            return False
+
+    # ---------- Cache-first (two-phase) export path you already had ----------
+
+    def collect_all_data(self, search_id: str) -> str:
+        """
+        Phase 1: Collect all data from the search and save to cache
+        Returns cache file path
+        """
+        try:
+            # Navigate to search
+            self.logger.info(f"🔍 Collecting data for search ID: {search_id}")
             alphasense_config = self.config.get_alphasense_config()
             base_url = alphasense_config.get('base_url', 'https://research.alpha-sense.com')
             search_url = f"{base_url}/search?search_id={search_id}"
@@ -347,163 +697,269 @@ class AlphaSenseScraper:
             self.driver.get(search_url)
 
             if not self._wait_for_results():
-                raise Exception("Results did not load within timeout")
-        
-        except Exception as e:
-            self.logger.error(f"Error during saved search retrieval: {e}")
+                raise Exception("Results did not load")
 
-        # scrolling through virtualized list and collect data progressively
-        try:
-            self.logger.info("Scrolling through virtualized list to collect all data...")
-            total_collected = self._scroll_to_load_more_rows(target_rows=121)  
-            self.logger.info(f"Successfully collected {total_collected} total rows")
+            # Collect all data using virtualized scrolling
+            self.logger.info("📊 Starting data collection phase...")
+            total_collected = self._scroll_to_load_more_rows(target_rows=200)  # Collect more rows
             
-            print(f"Collected {len(self.collected_row_data)} unique rows from virtualized list:")
-            for i, row_data in enumerate(self.collected_row_data):
-                print(f"Row {i}: {row_data}")
+            if total_collected == 0:
+                raise Exception("No data collected")
+            
+            # Save to cache
+            cache_file = self._save_to_cache(search_id, self.collected_row_data)
+            
+            self.logger.info(f"✅ Data collection complete! Collected {total_collected} rows")
+            return cache_file
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error during data collection: {e}")
+            raise
+
+    def _select_checkbox_for_visible_row(self, target_row_index: int) -> bool:
+        """
+        Select checkbox for a row that should be currently visible (row-index path).
+        Kept for cache/bundle flow.
+        """
+        try:
+            visible_rows = self.driver.find_elements(By.CSS_SELECTOR, 'div[data-testid="ResultsListRow"]')
+            target_row = None
+            
+            for row in visible_rows:
+                row_index = row.get_attribute('data-cy-rowindex')
+                if row_index and int(row_index) == target_row_index:
+                    target_row = row
+                    break
+            
+            if not target_row:
+                self.logger.warning(f"❌ Row {target_row_index} not found among visible rows")
+                return False
+
+            return self._select_checkbox_in_row(target_row)
+        except Exception as e:
+            self.logger.error(f"Error selecting checkbox for row {target_row_index}: {e}")
+            return False
+
+    def export_from_cache(self, cache_file: str, bundle_size: int = 20, output_dir: str = './exports') -> list:
+        """
+        Phase 2: Export documents in bundles using cached data
+        """
+        try:
+            # Load cached data
+            cache_data = self._load_from_cache(cache_file)
+            rows = cache_data['rows']
+            search_id = cache_data['search_id']
+            
+            self.logger.info(f"🚀 Starting export phase for {len(rows)} rows in bundles of {bundle_size}")
+            
+            # Navigate back to search
+            alphasense_config = self.config.get_alphasense_config()
+            base_url = alphasense_config.get('base_url', 'https://research.alpha-sense.com')
+            search_url = f"{base_url}/search?search_id={search_id}"
+            self.driver.get(search_url)
+            
+            if not self._wait_for_results():
+                raise Exception("Results did not load")
+            
+            scrollable_container = self._get_scrollable_container()
+            exported_files = []
+            
+            # Process in bundles
+            for bundle_start in range(0, len(rows), bundle_size):
+                bundle_end = min(bundle_start + bundle_size, len(rows))
+                bundle_rows = rows[bundle_start:bundle_end]
+                
+                self.logger.info(f"📦 Processing bundle {bundle_start//bundle_size + 1}: rows {bundle_start}-{bundle_end-1}")
+                
+                # Reset to top of list
+                self.driver.execute_script("arguments[0].scrollTop = 0;", scrollable_container)
+                time.sleep(1)
+                
+                # Clear any existing selections
+                self.driver.execute_script("""
+                    const checkboxes = document.querySelectorAll('input[data-chmlnid="ResultListDocumentCheckbox"]:checked, input[type="checkbox"]:checked');
+                    checkboxes.forEach(cb => { if (cb.checked) cb.click(); });
+                """)
+                time.sleep(1)
+                
+                # Select rows for this bundle
+                selected_count = 0
+                for row_data in bundle_rows:
+                    row_index = row_data.get('row_index')
+                    if not row_index:
+                        continue
+                    
+                    try:
+                        row_index_int = int(row_index)
+                        self.logger.info(f"  📍 Selecting row {row_index_int}")
+                        
+                        # Scroll to make row visible
+                        if self._scroll_to_specific_row_index(row_index_int, scrollable_container):
+                            # Select the checkbox
+                            if self._select_checkbox_for_visible_row(row_index_int):
+                                selected_count += 1
+                                self.logger.info(f"  ✅ Selected row {row_index_int} ({selected_count}/{len(bundle_rows)})")
+                            else:
+                                self.logger.warning(f"  ❌ Failed to select row {row_index_int}")
+                        else:
+                            self.logger.warning(f"  ❌ Could not scroll to row {row_index_int}")
+                            
+                        # Small delay between selections
+                        time.sleep(0.3)
+                        
+                    except (ValueError, TypeError):
+                        self.logger.warning(f"  ❌ Invalid row index: {row_index}")
+                        continue
+                
+                self.logger.info(f"📊 Bundle selection complete: {selected_count}/{len(bundle_rows)} rows selected")
+                
+                # Export this bundle if we have selections
+                if selected_count >= 1:  # Export even with 1 item
+                    if self._click_export_button():
+                        # Handle download
+                        time.sleep(3)  # Wait for any permission dialogs
+                        
+                        if self._wait_for_download(output_dir, timeout=60):
+                            self.logger.info(f"✅ Bundle {bundle_start//bundle_size + 1} exported successfully!")
+                            exported_files.append(f"bundle_{bundle_start//bundle_size + 1}")
+                        else:
+                            self.logger.warning(f"⚠️ Bundle {bundle_start//bundle_size + 1} export attempted but no download detected")
+                            exported_files.append(f"bundle_{bundle_start//bundle_size + 1}_partial")
+                    else:
+                        self.logger.error(f"❌ Failed to export bundle {bundle_start//bundle_size + 1}")
+                else:
+                    self.logger.error(f"❌ No rows selected for bundle {bundle_start//bundle_size + 1}")
+                
+                # Wait between bundles
+                time.sleep(2)
+            
+            self.logger.info(f"🎉 Export complete! Processed {len(exported_files)} bundles")
+            return exported_files
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error during export from cache: {e}")
+            return []
+
+    def export_saved_search(self, search_id: str, max_results: int = 100, output_dir: str = './exports') -> list:
+        """
+        Complete export process: collect data first, then export in bundles
+        """
+        try:
+            self.logger.info(f"🚀 Starting complete export process for search {search_id}")
+            
+            # Phase 1: Collect all data
+            self.logger.info("📊 Phase 1: Collecting all data...")
+            cache_file = self.collect_all_data(search_id)
+            
+            # Phase 2: Export in bundles
+            self.logger.info("📦 Phase 2: Exporting in bundles...")
+            exported_files = self.export_from_cache(cache_file, bundle_size=20, output_dir=output_dir)
+            
+            if exported_files:
+                self.logger.info(f"✅ Complete export successful! {len(exported_files)} bundles exported")
+                return exported_files
+            else:
+                self.logger.error("❌ No files were exported")
+                return []
                 
         except Exception as e:
-            self.logger.error(f"Error during virtualized list collection: {e}")
+            self.logger.error(f"❌ Error in complete export process: {e}")
+            return []
 
-        # smaller batch for selection (since DOM only shows ~27)
+    def resume_export_from_cache(self, cache_file: str, output_dir: str = './exports') -> list:
+        """
+        Resume export process using existing cache file
+        Useful if the export phase failed but data collection succeeded
+        """
+        self.logger.info(f"🔄 Resuming export from cache file: {cache_file}")
+        return self.export_from_cache(cache_file, bundle_size=20, output_dir=output_dir)
+
+    def list_cache_files(self) -> list:
+        """List available cache files"""
+        cache_files = list(self.cache_dir.glob('search_*.json'))
+        self.logger.info(f"📁 Found {len(cache_files)} cache files:")
+        for cache_file in cache_files:
+            self.logger.info(f"  - {cache_file.name}")
+        return [str(f) for f in cache_files]
+
+    def debug_checkbox_structure(self, max_rows: int = 3) -> None:
+        """
+        Debug method to understand the checkbox structure in the current page
+        """
+        self.logger.info("🔍 Debugging checkbox structure...")
+        
         try:
-            scrollable_container = self.driver.find_element(
-                By.CSS_SELECTOR,
-                'div[name="ResultList"] div[style*="overflow"]'
-            )
-            self.driver.execute_script("arguments[0].scrollTop = 0;", scrollable_container)
-            time.sleep(1)
+            visible_rows = self.driver.find_elements(By.CSS_SELECTOR, 'div[data-testid="ResultsListRow"]')
+            self.logger.info(f"Found {len(visible_rows)} visible rows")
             
-        except Exception as e:
-            self.logger.error(f"Error resetting scroll position: {e}")
-
-        try:
-            html = self.driver.page_source
-            soup = BeautifulSoup(html, "html.parser")
-
-            row_divs = soup.find_all("div", {"data-testid": "ResultsListRow"})
-            print(f"Found {len(row_divs)} rows currently visible for selection.")
-
-            for i, row in enumerate(row_divs[:5]):  
-                row_index = row.get("data-cy-rowindex")
-                title = row.find(attrs={'data-testid': 'resultsPaneCell-title'})
-                print(f"Visible row {i}: Index {row_index}, Title: {title.text.strip() if title else 'N/A'}")
-            
-        except Exception as e:
-            self.logger.error(f"Error during visible rows parsing: {e}")
-
-        max_rows = min(30, len(getattr(self, 'collected_row_data', []))) 
-
-        try:
-            selector = 'div[data-testid="ResultsListRow"]'
-            block_size = 20
-
-            time.sleep(1)
-            
-            row_elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-            total_rows = len(row_elements)
-
-            if not row_elements:
-                self.logger.warning(f"No result elements found with selector: {selector}")
-            else:
-                self.logger.info(f"Found {total_rows} result elements with selector: {selector}")
-
-                start_idx = 0
-                while start_idx < total_rows and start_idx < max_rows:
-                    end_idx = min(start_idx + block_size, total_rows, max_rows)
-                    print(f"Selecting rows {start_idx} to {end_idx - 1}")
-                    
+            for i, row in enumerate(visible_rows[:max_rows]):
+                row_index = row.get_attribute('data-cy-rowindex')
+                self.logger.info(f"\n--- Row {i} (index: {row_index}) ---")
+                
+                # Check for different checkbox patterns
+                checkbox_patterns = [
+                    'div[data-testid="resultsPaneCell-checkbox"]',
+                    'input[data-chmlnid="ResultListDocumentCheckbox"]',
+                    'input[type="checkbox"]',
+                    '.as-checkbox-icon',
+                    '[class*="checkbox"]',
+                    'label',
+                ]
+                
+                for pattern in checkbox_patterns:
                     try:
-                        row_elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                        if len(row_elements) < end_idx:
-                            self.logger.warning(f"Not enough rows found. Expected {end_idx}, got {len(row_elements)}")
-                            break
-                    except Exception as e:
-                        self.logger.error(f"Error refreshing row elements: {e}")
-                        break
-
-                    try:
-                        first_element = row_elements[start_idx]
-                        self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", first_element)
-                        time.sleep(0.3)  
-                        first_element.click()
-                        time.sleep(0.2)
-                    except StaleElementReferenceException:
-                        self.logger.warning(f"Stale element at start index {start_idx}, refreshing and retrying...")
-                        row_elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                        if len(row_elements) > start_idx:
-                            first_element = row_elements[start_idx]
-                            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", first_element)
-                            time.sleep(0.3)
-                            first_element.click()
-                            time.sleep(0.2)
+                        elements = row.find_elements(By.CSS_SELECTOR, pattern)
+                        if elements:
+                            self.logger.info(f"  ✓ Found {len(elements)} elements with pattern: {pattern}")
+                            for j, elem in enumerate(elements[:2]):  # Show first 2
+                                self.logger.info(f"    Element {j}: {elem.tag_name}, classes: {elem.get_attribute('class')}")
                         else:
-                            self.logger.error(f"Cannot recover from stale element at index {start_idx}")
-                            break
-
-                    actions = ActionChains(self.driver)
-                    actions.key_down(Keys.SHIFT)
+                            self.logger.info(f"  ❌ No elements found with pattern: {pattern}")
+                    except Exception as e:
+                        self.logger.info(f"  ❌ Error with pattern {pattern}: {e}")
+                
+                # Check if row is clickable
+                try:
+                    is_clickable = self.driver.execute_script("""
+                        const row = arguments[0];
+                        const rect = row.getBoundingClientRect();
+                        const style = window.getComputedStyle(row);
+                        
+                        return {
+                            hasClickListener: row.onclick !== null,
+                            cursor: style.cursor,
+                            pointerEvents: style.pointerEvents,
+                            position: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+                        };
+                    """, row)
+                    self.logger.info(f"  Row clickability: {is_clickable}")
+                except Exception as e:
+                    self.logger.info(f"  Error checking clickability: {e}")
+                
+                # Get a preview of the row HTML
+                try:
+                    row_html = row.get_attribute('outerHTML')[:300]  # First 300 chars
+                    self.logger.info(f"  HTML preview: {row_html}...")
+                except Exception as e:
+                    self.logger.info(f"  Error getting HTML: {e}")
                     
-                    for idx in range(start_idx + 1, end_idx):
-                        try:
-                            actions.send_keys(Keys.ARROW_DOWN)
-                            actions.perform()
-                            time.sleep(0.15) 
-                        except StaleElementReferenceException:
-                            self.logger.warning(f"Stale element during arrow key navigation at row {idx}")
-                            actions = ActionChains(self.driver)
-                            actions.key_down(Keys.SHIFT)
-                        except Exception as e:
-                            self.logger.warning(f"Error during arrow key navigation at row {idx}: {e}")
-                    
-                    actions.key_up(Keys.SHIFT)
-                    actions.perform()
-                    time.sleep(0.3) 
-                    print(f"Selected block {start_idx}-{end_idx - 1}")
-
-                    if end_idx < total_rows and end_idx < max_rows:
-                        try:
-                            row_elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                            if len(row_elements) > end_idx:
-                                next_element = row_elements[end_idx]
-                                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_element)
-                                time.sleep(0.3)
-                                next_element.click() 
-                                time.sleep(0.2)
-                            else:
-                                self.logger.warning(f"Cannot find next element at index {end_idx}")
-                        except StaleElementReferenceException:
-                            self.logger.warning(f"Stale element when moving to next block at index {end_idx}")
-                    
-                    start_idx = end_idx 
-
         except Exception as e:
-            self.logger.error(f"Error during block row selection: {e}")
+            self.logger.error(f"Error in debug_checkbox_structure: {e}")
 
-    def _scroll_and_click_row(self, selector, row_idx, timeout=5):
-        # Wait for elements to appear
+    def get_cache_info(self, cache_file: str) -> dict:
+        """Get basic information about a cache file."""
         try:
-            WebDriverWait(self.driver, timeout).until(
-                lambda d: len(d.find_elements(By.CSS_SELECTOR, selector)) > row_idx
-            )
-        except TimeoutException:
-            print(f"Row {row_idx} did not appear after {timeout}s")
-            return False
-
-        # Refetch elements and get the desired row
-        row_elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-        if len(row_elements) <= row_idx:
-            print(f"Row index {row_idx} not found in DOM.")
-            return False
-
-        el = row_elements[row_idx]
-        # Scroll into view
-        self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-        # Wait for clickable
-        try:
-            WebDriverWait(self.driver, timeout).until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
-            el.click()
-            return True
-        except TimeoutException:
-            print(f"Row {row_idx} not clickable after scrolling.")
-            return False
+            cache_data = self._load_from_cache(cache_file)
+            return {
+                'search_id': cache_data.get('search_id'),
+                'collected_at': cache_data.get('collected_at'),
+                'total_rows': cache_data.get('total_rows'),
+                'first_few_titles': [
+                    (row.get('title') or 'N/A') if not row.get('title') or len(row.get('title')) <= 50
+                    else row.get('title')[:50] + '...'
+                    for row in cache_data.get('rows', [])[:3]
+                ]
+            }
+        except Exception as e:
+            self.logger.error(f"Error reading cache file {cache_file}: {e}")
+            return {}

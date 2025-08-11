@@ -36,6 +36,8 @@ def main():
 
         scraper.logger.info("✅ Login successful!")
 
+
+
         searches = {}
         with open('saved_searches.csv', newline='', encoding='utf-8') as csvfile:
             reader = csv.DictReader(csvfile)
@@ -43,6 +45,8 @@ def main():
                 search_name = row['search_name']
                 search_id = row['search_id']
                 searches[search_name] = search_id
+
+        scraper.export_first_n_in_search(search_id="33f44ae2-0467-4f79-ab72-54e18a430ca8", n=20, output_dir="./exports")
 
         
         for name, id in searches.items():
