@@ -27,7 +27,6 @@ from logger import get_logger
 
 
 class AlphaSenseScraper:
-    
     def __init__(self, config: Config, headless: bool = True):
         self.config = config
         self.logger = get_logger(__name__)
@@ -332,7 +331,6 @@ class AlphaSenseScraper:
                         self.driver.execute_script("window.scrollBy(0, 1000);")
                         time.sleep(0.3)
                 
-                        
             else:
                 consecutive_no_new_items = 0 
                 current_strategy = 0 
@@ -348,54 +346,6 @@ class AlphaSenseScraper:
         self.collected_row_data = all_row_data
         
         return len(all_row_data)
-
-    # def _scroll_to_specific_row_index(self, target_row_index: int, scrollable_container) -> bool:
-        max_attempts = 15
-        
-        for attempt in range(max_attempts):
-            try:
-                visible_rows = self.driver.find_elements(By.CSS_SELECTOR, 'div[data-testid="ResultsListRow"]')
-                
-                current_visible_indexes = []
-                for row in visible_rows:
-                    row_index = row.get_attribute('data-cy-rowindex')
-                    if row_index:
-                        try:
-                            current_visible_indexes.append(int(row_index))
-                        except ValueError:
-                            continue
-                
-                if not current_visible_indexes:
-                    self.logger.warning(f"No visible row indexes found on attempt {attempt + 1}")
-                    continue
-                
-                min_visible = min(current_visible_indexes)
-                max_visible = max(current_visible_indexes)
-                
-                if min_visible <= target_row_index <= max_visible:
-                    self.logger.info(f"Target row {target_row_index} is visible (range: {min_visible}-{max_visible})")
-                    return True
-                
-                if target_row_index < min_visible:
-                    scroll_amount = -(scrollable_container.size['height'] // 2)
-                    self.logger.info(f" Scrolling up to reach row {target_row_index} (currently {min_visible}-{max_visible})")
-                else:
-                    scroll_amount = scrollable_container.size['height'] // 2
-                    self.logger.info(f"Scrolling down to reach row {target_row_index} (currently {min_visible}-{max_visible})")
-                
-                self.driver.execute_script(
-                    "arguments[0].scrollTop += arguments[1];", 
-                    scrollable_container, 
-                    scroll_amount
-                )
-                time.sleep(0.8)
-                
-            except Exception as e:
-                self.logger.warning(f"Error in scroll attempt {attempt + 1} for row {target_row_index}: {e}")
-                time.sleep(0.5)
-        
-        self.logger.error(f"❌ Failed to make row {target_row_index} visible after {max_attempts} attempts")
-        return False
 
     def _select_checkbox_in_row(self, row) -> bool:
         try:
