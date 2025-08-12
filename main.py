@@ -17,7 +17,7 @@ from scraper import AlphaSenseScraper
 
 
 def unzip_and_flatten(download_dir: Path):
-    """Unzip all ZIPs in download_dir, move extracted files into download_dir (no subfolders), then remove ZIPs/temp."""
+    """Unzip all ZIPs in download_dir, move extracted files into download_dir, then remove ZIPs/temp."""
     download_dir = Path(download_dir).resolve()
     download_dir.mkdir(parents=True, exist_ok=True)
 

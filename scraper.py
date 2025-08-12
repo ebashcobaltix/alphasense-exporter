@@ -1,3 +1,5 @@
+# scraper.py
+
 import time
 import os
 import json
@@ -27,6 +29,8 @@ from logger import get_logger
 
 
 class AlphaSenseScraper:
+    """Core scraper class for AlphaSense saved search exports"""
+    
     def __init__(self, config: Config, headless: bool = True):
         self.config = config
         self.logger = get_logger(__name__)
@@ -39,6 +43,7 @@ class AlphaSenseScraper:
         self._setup_browser()
     
     def _setup_browser(self) -> None:
+        """set up chrome browser with all necessary options and configurations"""
         chrome_options = Options()
         if self.headless:
             chrome_options.add_argument('--headless')
@@ -92,7 +97,6 @@ class AlphaSenseScraper:
 
     def login(self, username: str, password: str) -> bool:
         self.driver.get("https://research.alpha-sense.com/login")
-        
         self.logger.info("Entering username")
 
         try:
@@ -104,7 +108,6 @@ class AlphaSenseScraper:
             return False
 
         self.logger.info("Pressing continue")
-
         try:
             continue_button = self.driver.find_element(By.XPATH, "//button[contains(text(), 'Continue')]")
             continue_button.click()
@@ -113,7 +116,6 @@ class AlphaSenseScraper:
             return False
 
         self.logger.info("Entering password")
-
         try:
             password_field = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='password']")))
             password_field.clear()
@@ -121,7 +123,6 @@ class AlphaSenseScraper:
         except TimeoutException:
             self.logger.error("Could not find password field")
             return False
-
         try:
             submit_button = self.driver.find_element(By.CSS_SELECTOR, "[data-testid='loginSubmitButton']")
             submit_button.click()
@@ -168,10 +169,12 @@ class AlphaSenseScraper:
             return False
 
     def _get_cache_filename(self, search_id: str) -> str:
+        """generating a unique filename for caching search results"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"search_{search_id}_{timestamp}.json"
 
     def _save_to_cache(self, search_id: str, data: list) -> str:
+        """saving collected data to a cache file for later use"""
         cache_file = self.cache_dir / self._get_cache_filename(search_id)
         
         cache_data = {
@@ -188,13 +191,15 @@ class AlphaSenseScraper:
         return str(cache_file)
 
     def _load_from_cache(self, cache_file: str) -> dict:
+        """loading previously saved data from the cache file"""
         with open(cache_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
-        self.logger.info(f"📂 Loaded {data['total_rows']} rows from cache: {cache_file}")
+        self.logger.info(f"Loaded {data['total_rows']} rows from cache: {cache_file}")
         return data
 
     def _get_scrollable_container(self):
+        """finding the main scrollable container on the page that contains results"""
         candidates = [
             '[data-testid="ResultsList"] [class*="simplebar-content-wrapper"]',
             'div[name="ResultList"] div[style*="overflow"]',
@@ -211,6 +216,7 @@ class AlphaSenseScraper:
         return self.driver.find_element(By.TAG_NAME, 'body')
 
     def _get_scrollable_container_js(self):
+        """using js to find the scrollable container"""
         return self.driver.execute_script("""
             let c =
               document.querySelector('[data-testid="ResultsList"] [class*="simplebar-content-wrapper"]') ||
@@ -220,7 +226,7 @@ class AlphaSenseScraper:
         """)
 
     def _scroll_row_into_view_js(self, row_index: int) -> bool:
-    
+        """scrolling to bring a specific row into view using js"""
         for _ in range(18): 
             found = self.driver.execute_script("""
                 const idx = arguments[0];
@@ -244,8 +250,10 @@ class AlphaSenseScraper:
         return False
 
     def _scroll_to_load_more_rows(self, target_rows: int = 121) -> int:
+        """scrolling through the results to load more rows and collect their data"""
         scrollable_container = self._get_scrollable_container()
 
+        # initialize tracking variables
         all_row_data = []
         seen_document_ids = set()
         scroll_attempts = 0
@@ -253,6 +261,7 @@ class AlphaSenseScraper:
         consecutive_no_new_items = 0
         max_consecutive = 8
         
+        # different scrolling strategies to try
         strategies = [
             "keyboard_navigation", 
             "scroll_container", 
@@ -265,19 +274,23 @@ class AlphaSenseScraper:
         while len(all_row_data) < target_rows and scroll_attempts < max_scroll_attempts:
             scroll_attempts += 1
             
+            # parse the current page to find result rows
             html = self.driver.page_source
             soup = BeautifulSoup(html, "html.parser")
             row_divs = soup.find_all("div", {"data-testid": "ResultsListRow"})
             
+            # process each row found on the page
             batch_new_items = 0
             for row in row_divs:
                 doc_div = row.find("div", {"data-cy-document-id": True})
                 document_id = doc_div["data-cy-document-id"] if doc_div else None
                 
+                # only process new documents NOT duplicates
                 if document_id and document_id not in seen_document_ids:
                     seen_document_ids.add(document_id)
                     batch_new_items += 1
                     
+                    # extract all these data fields from the row
                     row_index = row.get("data-cy-rowindex")
                     source = row.find(attrs={'data-testid': 'resultsPaneCell-source'})
                     author = row.find(attrs={'data-testid': 'resultsPaneCell-author'})
@@ -288,6 +301,7 @@ class AlphaSenseScraper:
                     ticker = row.find(attrs={'data-testid': 'resultsPaneCell-ticker'})
                     company = row.find(attrs={'data-testid': 'resultsPaneCell-company'})
 
+                    # create a data object for this row
                     row_data = {
                         'row_index': row_index,
                         'document_id': document_id,
@@ -318,6 +332,7 @@ class AlphaSenseScraper:
                         consecutive_no_new_items = 0  
                 strategy = strategies[current_strategy % len(strategies)]
                 
+                # trying different scrolling methods
                 if strategy == "scroll_container":
                     for i in range(5):
                         self.driver.execute_script(
@@ -343,17 +358,21 @@ class AlphaSenseScraper:
         
         self.logger.info(f"Collected {len(all_row_data)} total unique rows after {scroll_attempts} attempts")
         
+        # store collected data
         self.collected_row_data = all_row_data
         
         return len(all_row_data)
 
     def _select_checkbox_in_row(self, row) -> bool:
+        """select the checkbox for a specific result row"""
         try:
+            # hover over the row to reveal controls
             try:
                 ActionChains(self.driver).move_to_element(row).pause(0.15).perform()
             except Exception:
                 pass
 
+            # try to find the checkbox using these different selectors
             checkbox = None
             for sel in [
                 'input[data-chmlnid="ResultListDocumentCheckbox"]',
@@ -366,6 +385,7 @@ class AlphaSenseScraper:
                 except NoSuchElementException:
                     continue
 
+            # if no checkbox, try clicking container to reveal it
             if checkbox is None:
                 try:
                     container = row.find_element(By.CSS_SELECTOR, 'div[data-testid="resultsPaneCell-checkbox"], [class*="checkbox"]')
@@ -388,6 +408,7 @@ class AlphaSenseScraper:
                 try:
                     self.driver.execute_script("arguments[0].click();", checkbox)
                 except Exception:
+                    # force selection with js if clicking fails
                     self.driver.execute_script("""
                         const cb = arguments[0];
                         cb.checked = true;
@@ -402,6 +423,7 @@ class AlphaSenseScraper:
             return False
 
     def _wait_for_download(self, download_dir: str, timeout: int = 30) -> bool:
+        """waiting for a file to be downloaded to the specified directory"""
         download_path = Path(download_dir)
         initial_files = set(download_path.glob('*')) if download_path.exists() else set()
         
@@ -419,8 +441,10 @@ class AlphaSenseScraper:
         return False
 
     def _click_export_button(self) -> bool:
+        """find and click the export button on the page"""
         time.sleep(0.8)  
 
+        # try to find and click export button directly
         clicked = self.driver.execute_script("""
             const labels = ['export original','export documents','export'];
             const buttons = [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null);
@@ -434,6 +458,7 @@ class AlphaSenseScraper:
             self.logger.info("Export button clicked successfully!")
             return True
 
+        # if direct export not found, try "more" menu
         self.logger.info("Looking for More button...")
         more = self.driver.execute_script("""
             const btn = [...document.querySelectorAll('button')]
@@ -443,6 +468,7 @@ class AlphaSenseScraper:
         """)
         if more:
             time.sleep(0.4)
+            # look for export option in dropdown menu
             export_clicked = self.driver.execute_script("""
                 const items = [...document.querySelectorAll('button, [role="menuitem"], [data-testid]')]
                     .filter(x => x.offsetParent !== null);
@@ -460,6 +486,7 @@ class AlphaSenseScraper:
         return False
 
     def _row_soft_key(self, row) -> str:
+        """generate a unique key for a row based on title and date"""
         try:
             title = row.find_element(By.CSS_SELECTOR, '[data-testid="resultsPaneCell-title"]').text.strip()
         except Exception:
@@ -471,6 +498,7 @@ class AlphaSenseScraper:
         return f"{title}||{date}".lower()
 
     def _select_first_n_checkboxes(self, n: int = 20) -> int:
+        """select checkboxes for the first n rows in the results"""
         selected = 0
         tries_without_progress = 0
         max_tries = 12
@@ -483,6 +511,7 @@ class AlphaSenseScraper:
                 offset += 1
                 continue
 
+            # use js to select checkbox for this row
             success = self.driver.execute_script("""
                 const idx = arguments[0];
 
@@ -539,9 +568,11 @@ class AlphaSenseScraper:
         return selected
 
     def export_first_n_in_search(self, search_id: str, n: int = 20, output_dir: str = './exports') -> bool:
+        """exporting the first n documents from a search"""
         try:
             self.logger.info(f"🔎 Exporting first {n} docs from search {search_id}")
 
+            # search results page
             base_url = self.config.get_alphasense_config().get('base_url', 'https://research.alpha-sense.com')
             search_url = f"{base_url}/search?search_id={search_id}"
             self.driver.get(search_url)
@@ -549,11 +580,13 @@ class AlphaSenseScraper:
             if not self._wait_for_results(timeout=20):
                 raise Exception("Results did not load")
 
+            # select checkboxes for first n rows
             selected = self._select_first_n_checkboxes(n=n)
             if selected == 0:
                 self.logger.error("No rows were selected — aborting export.")
                 return False
 
+            # click export 
             if not self._click_export_button():
                 self.logger.error("Export button not found/click failed.")
                 return False
@@ -569,6 +602,7 @@ class AlphaSenseScraper:
             return False
 
     def collect_all_data(self, search_id: str) -> str:
+        """collecting all available data from a search and save to cache"""
         try:
             self.logger.info(f"🔍 Collecting data for search ID: {search_id}")
             alphasense_config = self.config.get_alphasense_config()
@@ -586,6 +620,7 @@ class AlphaSenseScraper:
             if total_collected == 0:
                 raise Exception("No data collected")
             
+            # saving the collected data to cache file
             cache_file = self._save_to_cache(search_id, self.collected_row_data)
             
             self.logger.info(f"Data collection complete! Collected {total_collected} rows")
@@ -596,6 +631,7 @@ class AlphaSenseScraper:
             raise
 
     def _select_checkbox_for_visible_row(self, target_row_index: int) -> bool:
+        """selecting the checkbox for a specific row that's currently visible"""
         try:
             visible_rows = self.driver.find_elements(By.CSS_SELECTOR, 'div[data-testid="ResultsListRow"]')
             target_row = None
@@ -616,13 +652,16 @@ class AlphaSenseScraper:
             return False
 
     def export_from_cache(self, cache_file: str, bundle_size: int = 20, output_dir: str = './exports') -> list:
+        """exporting documents using previously cached data, processing in bundles"""
         try:
+            # load cached data
             cache_data = self._load_from_cache(cache_file)
             rows = cache_data['rows']
             search_id = cache_data['search_id']
             
             self.logger.info(f"Starting export phase for {len(rows)} rows in bundles of {bundle_size}")
             
+            # search results page
             alphasense_config = self.config.get_alphasense_config()
             base_url = alphasense_config.get('base_url', 'https://research.alpha-sense.com')
             search_url = f"{base_url}/search?search_id={search_id}"
@@ -634,6 +673,7 @@ class AlphaSenseScraper:
             scrollable_container = self._get_scrollable_container()
             exported_files = []
             
+            # processing the rows in bundles
             for bundle_start in range(0, len(rows), bundle_size):
                 bundle_end = min(bundle_start + bundle_size, len(rows))
                 bundle_rows = rows[bundle_start:bundle_end]
@@ -676,6 +716,7 @@ class AlphaSenseScraper:
                 
                 self.logger.info(f"Bundle selection complete: {selected_count}/{len(bundle_rows)} rows selected")
                 
+                # export this bundle if we have selected rows
                 if selected_count >= 1: 
                     if self._click_export_button():
                         time.sleep(3) 
@@ -701,12 +742,15 @@ class AlphaSenseScraper:
             return []
 
     def export_saved_search(self, search_id: str, max_results: int = 100, output_dir: str = './exports') -> list:
+        """run the complete export process for a search"""
         try:
             self.logger.info(f"Starting complete export process for search {search_id}")
             
+            # collecting all data and save to cache
             self.logger.info("Phase 1: Collecting all data...")
             cache_file = self.collect_all_data(search_id)
             
+            # exporting using cached data in bundles
             self.logger.info("Phase 2: Exporting in bundles...")
             exported_files = self.export_from_cache(cache_file, bundle_size=20, output_dir=output_dir)
             
@@ -722,10 +766,12 @@ class AlphaSenseScraper:
             return []
 
     def resume_export_from_cache(self, cache_file: str, output_dir: str = './exports') -> list:
+        """resume an export using a previously saved cache file"""
         self.logger.info(f"Resuming export from cache file: {cache_file}")
         return self.export_from_cache(cache_file, bundle_size=20, output_dir=output_dir)
 
     def list_cache_files(self) -> list:
+        """list all available cache files"""
         cache_files = list(self.cache_dir.glob('search_*.json'))
         self.logger.info(f"Found {len(cache_files)} cache files:")
         for cache_file in cache_files:
@@ -733,6 +779,7 @@ class AlphaSenseScraper:
         return [str(f) for f in cache_files]
 
     def debug_checkbox_structure(self, max_rows: int = 3) -> None:
+        """debug method to examine checkbox structure on the page"""
         self.logger.info("Debugging checkbox structure...")
         
         try:
@@ -764,6 +811,7 @@ class AlphaSenseScraper:
                     except Exception as e:
                         self.logger.info(f"Error with pattern {pattern}: {e}")
                 
+                # check if row is clickable
                 try:
                     is_clickable = self.driver.execute_script("""
                         const row = arguments[0];
@@ -781,7 +829,7 @@ class AlphaSenseScraper:
                 except Exception as e:
                     self.logger.info(f"  Error checking clickability: {e}")
                 
-                # HTML row prev
+                # show html preview
                 try:
                     row_html = row.get_attribute('outerHTML')[:300] 
                     self.logger.info(f"  HTML preview: {row_html}...")
@@ -792,6 +840,7 @@ class AlphaSenseScraper:
             self.logger.error(f"Error in debug_checkbox_structure: {e}")
 
     def get_cache_info(self, cache_file: str) -> dict:
+        """getting the information about a cache file"""
         try:
             cache_data = self._load_from_cache(cache_file)
             return {
